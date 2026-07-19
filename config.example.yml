@@ -12,6 +12,7 @@ download_providers:
     user_agent: nzb-repair/1.0
     quota_bytes: 0          # 0 = unlimited
     quota_period_hours: 0   # 0 = no rolling window
+    reconnect_delay_seconds: 30  # re-add a provider this long after a 502; 0 = default (30s), negative = disabled
 
 upload_providers:
   - host: upload.example.com
@@ -33,6 +34,12 @@ scan_interval: 5m
 
 # Maximum number of retries for a failed download
 max_retries: 3
+
+# Per-segment download retries on transient NNTP errors (e.g. 502 "too many connections").
+# The delay grows exponentially with jitter, capped at download_retry_max_delay.
+download_retries: 5            # 0 = default (5)
+download_retry_base_delay: 2s  # 0 = default (2s)
+download_retry_max_delay: 60s  # 0 = default (60s)
 
 # Folder to move broken files to
 broken_folder: broken

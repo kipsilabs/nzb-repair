@@ -357,6 +357,7 @@ func toNNTPProvider(p config.ProviderConfig) nntppool.Provider {
 		UserAgent:         p.UserAgent,
 		QuotaBytes:        p.QuotaBytes,
 		QuotaPeriod:       time.Duration(p.QuotaPeriodHours) * time.Hour,
+		ReconnectDelay:    time.Duration(p.ReconnectDelaySeconds) * time.Second,
 	}
 }
 
