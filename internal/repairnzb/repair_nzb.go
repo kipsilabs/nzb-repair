@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	mrand "math/rand/v2"
 	"os"
 	"path/filepath"
 	"sync"
@@ -33,10 +34,77 @@ type NNTPPool interface {
 
 const defaultSegmentSize = 750_000 // bytes per uploaded segment for recreated par2 files
 
+// isRetryableDownloadErr reports whether a segment download error is transient
+// and worth retrying. Terminal cases are handled by the caller:
+//   - context.Canceled: the whole repair is being torn down.
+//   - ErrArticleNotFound: the segment is genuinely missing and routed for repair.
+//   - ErrQuotaExceeded: the provider quota won't recover within this run.
+//
+// Everything else (including the generic wrapped "all providers exhausted: ...
+// 502 too many connections" error, which is NOT the ErrServiceUnavailable
+// sentinel) is treated as transient.
+func isRetryableDownloadErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	if errors.Is(err, nntppool.ErrArticleNotFound) {
+		return false
+	}
+	if errors.Is(err, nntppool.ErrQuotaExceeded) {
+		return false
+	}
+	return true
+}
+
+// backoffDelay returns an exponential backoff with full jitter for the given
+// attempt, capped at max. The result is in the range [capped/2, capped] where
+// capped = min(base*2^attempt, max).
+func backoffDelay(attempt int, base, max time.Duration) time.Duration {
+	capped := base << attempt // base * 2^attempt
+	if capped <= 0 || capped > max {
+		// Guard against shift overflow and cap at max.
+		capped = max
+	}
+	half := capped / 2
+	return half + time.Duration(mrand.Int64N(int64(half)+1)) // [half, capped]
+}
+
+// retryDownload runs op, retrying transient failures with backoff. Non-retryable
+// errors are returned immediately for the caller to classify. After cfg.DownloadRetries
+// failed retries the last error is returned. ctx cancellation aborts the wait.
+func retryDownload(ctx context.Context, cfg config.Config, label string, op func() error) error {
+	var lastErr error
+	for attempt := 0; ; attempt++ {
+		err := op()
+		if err == nil {
+			return nil
+		}
+		if !isRetryableDownloadErr(err) {
+			return err
+		}
+		lastErr = err
+		if int64(attempt) >= cfg.DownloadRetries {
+			return lastErr
+		}
+		delay := backoffDelay(attempt, cfg.DownloadRetryBaseDelay, cfg.DownloadRetryMaxDelay)
+		slog.WarnContext(ctx, fmt.Sprintf("transient error downloading %s, retry %d/%d in %s: %v",
+			label, attempt+1, cfg.DownloadRetries, delay, err))
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+}
+
 // countMissingParSegments checks par2 segments without writing to disk.
 // Returns (missing, total, error).
 func countMissingParSegments(
 	ctx context.Context,
+	cfg config.Config,
 	downloadPool NNTPPool,
 	parFiles []nzbparser.NzbFile,
 ) (missing, total int64, err error) {
@@ -46,7 +114,10 @@ func countMissingParSegments(
 			if ctx.Err() != nil {
 				return missing, total, ctx.Err()
 			}
-			_, segErr := downloadPool.BodyStream(ctx, s.Id, io.Discard)
+			segErr := retryDownload(ctx, cfg, s.Id, func() error {
+				_, e := downloadPool.BodyStream(ctx, s.Id, io.Discard)
+				return e
+			})
 			if segErr != nil {
 				if errors.Is(segErr, nntppool.ErrArticleNotFound) {
 					missing++
@@ -266,7 +337,7 @@ func RepairNzb(
 	// Check par2 threshold (if configured)
 	needsParRecreation := false
 	if cfg.Par2RecreateThreshold > 0 && len(parFiles) > 0 {
-		missing, total, countErr := countMissingParSegments(ctx, downloadPool, parFiles)
+		missing, total, countErr := countMissingParSegments(ctx, cfg, downloadPool, parFiles)
 		if countErr != nil {
 			slog.With("err", countErr).WarnContext(ctx, "failed to count missing par2 segments, skipping threshold check")
 		} else if total > 0 {
@@ -583,7 +654,12 @@ func downloadWorker(
 		default:
 			p.Go(func(c context.Context) error {
 				buff := bytes.NewBuffer(make([]byte, 0))
-				if _, err := downloadPool.BodyStream(c, s.Id, buff); err != nil {
+				err := retryDownload(c, config, s.Id, func() error {
+					buff.Reset() // discard partial writes from a failed attempt
+					_, e := downloadPool.BodyStream(c, s.Id, buff)
+					return e
+				})
+				if err != nil {
 					if errors.Is(err, nntppool.ErrArticleNotFound) {
 						if brokenSegmentCh != nil {
 							slog.DebugContext(ctx, fmt.Sprintf("segment %s not found, sending for repair: %v", s.Id, err))

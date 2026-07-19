@@ -46,6 +46,10 @@ type ProviderConfig struct {
 	QuotaBytes int64 `yaml:"quota_bytes"`
 	// QuotaPeriodHours is the rolling window (in hours) after which the quota resets.
 	QuotaPeriodHours int `yaml:"quota_period_hours"`
+	// ReconnectDelaySeconds is how long (in seconds) to wait before re-adding a
+	// provider that was removed after a 502 "service unavailable" response.
+	// 0 defaults to 30s; use a negative value to disable auto-reconnect.
+	ReconnectDelaySeconds int `yaml:"reconnect_delay_seconds"`
 }
 
 type Config struct {
@@ -65,6 +69,14 @@ type Config struct {
 	Par2RecreateThreshold float64 `yaml:"par2_recreate_threshold"`
 	// Par2RecreateRedundancy is the recovery percentage used when creating a new par2 set.
 	Par2RecreateRedundancy int `yaml:"par2_recreate_redundancy"`
+	// DownloadRetries is the number of times a single segment download is retried
+	// on a transient error (e.g. 502 "too many connections") before giving up.
+	DownloadRetries int64 `yaml:"download_retries"`
+	// DownloadRetryBaseDelay is the initial backoff between download retries.
+	// The delay grows exponentially with jitter, capped at DownloadRetryMaxDelay.
+	DownloadRetryBaseDelay time.Duration `yaml:"download_retry_base_delay"`
+	// DownloadRetryMaxDelay caps the backoff between download retries.
+	DownloadRetryMaxDelay time.Duration `yaml:"download_retry_max_delay"`
 }
 
 type UploadConfig struct {
@@ -82,14 +94,18 @@ type Option func(*Config)
 
 var (
 	providerConfigDefault = ProviderConfig{
-		Connections: 10,
-		IdleTimeout: 2400 * time.Second,
+		Connections:           10,
+		IdleTimeout:           2400 * time.Second,
+		ReconnectDelaySeconds: 30,
 	}
-	downloadWorkersDefault = 10
-	uploadWorkersDefault   = 10
-	scanIntervalDefault    = 5 * time.Minute
-	maxRetriesDefault      = int64(3)
-	brokenFolderDefault    = "broken"
+	downloadWorkersDefault        = 10
+	uploadWorkersDefault          = 10
+	scanIntervalDefault           = 5 * time.Minute
+	maxRetriesDefault             = int64(3)
+	brokenFolderDefault           = "broken"
+	downloadRetriesDefault        = int64(5)
+	downloadRetryBaseDelayDefault = 2 * time.Second
+	downloadRetryMaxDelayDefault  = 60 * time.Second
 )
 
 func mergeWithDefault(config ...Config) Config {
@@ -104,6 +120,9 @@ func mergeWithDefault(config ...Config) Config {
 			MaxRetries:             maxRetriesDefault,
 			BrokenFolder:           brokenFolderDefault,
 			Par2RecreateRedundancy: 10,
+			DownloadRetries:        downloadRetriesDefault,
+			DownloadRetryBaseDelay: downloadRetryBaseDelayDefault,
+			DownloadRetryMaxDelay:  downloadRetryMaxDelayDefault,
 		}
 	}
 
@@ -117,6 +136,10 @@ func mergeWithDefault(config ...Config) Config {
 
 		if p.IdleTimeout == 0 {
 			p.IdleTimeout = providerConfigDefault.IdleTimeout
+		}
+
+		if p.ReconnectDelaySeconds == 0 {
+			p.ReconnectDelaySeconds = providerConfigDefault.ReconnectDelaySeconds
 		}
 
 		cfg.DownloadProviders[i] = p
@@ -135,6 +158,10 @@ func mergeWithDefault(config ...Config) Config {
 
 		if p.IdleTimeout == 0 {
 			p.IdleTimeout = providerConfigDefault.IdleTimeout
+		}
+
+		if p.ReconnectDelaySeconds == 0 {
+			p.ReconnectDelaySeconds = providerConfigDefault.ReconnectDelaySeconds
 		}
 
 		cfg.UploadProviders[i] = p
@@ -159,6 +186,18 @@ func mergeWithDefault(config ...Config) Config {
 
 	if cfg.Par2RecreateRedundancy == 0 {
 		cfg.Par2RecreateRedundancy = 10
+	}
+
+	if cfg.DownloadRetries == 0 {
+		cfg.DownloadRetries = downloadRetriesDefault
+	}
+
+	if cfg.DownloadRetryBaseDelay == 0 {
+		cfg.DownloadRetryBaseDelay = downloadRetryBaseDelayDefault
+	}
+
+	if cfg.DownloadRetryMaxDelay == 0 {
+		cfg.DownloadRetryMaxDelay = downloadRetryMaxDelayDefault
 	}
 
 	return cfg
