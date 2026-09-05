@@ -62,7 +62,7 @@ To set up the project for development, follow these steps:
 1. Clone the repository:
 
 ```sh
-git clone https://github.com/javi11/nzb-repair.git
+git clone https://github.com/kipsilabs/nzb-repair.git
 cd nntpcli
 ```
 
