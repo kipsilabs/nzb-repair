@@ -345,10 +345,19 @@ func toNNTPProvider(p config.ProviderConfig) nntppool.Provider {
 
 	return nntppool.Provider{
 		Host:              host,
+		Name:              p.Name,
 		TLSConfig:         tlsCfg,
 		Auth:              nntppool.Auth{Username: p.Username, Password: p.Password},
 		Connections:       p.Connections,
+		MinConnections:    p.MinConnections,
 		Inflight:          p.Inflight,
+		StatInflight:      p.StatInflight,
+		StreamInflight:    p.StreamInflight,
+		BackgroundFloor:   p.BackgroundFloor,
+		AbortDrainBytes:   p.AbortDrainBytes,
+		StorageGroup:      p.StorageGroup,
+		AttemptTimeout:    p.AttemptTimeout,
+		StallTimeout:      p.StallTimeout,
 		Backup:            p.Backup,
 		IdleTimeout:       p.IdleTimeout,
 		SkipPing:          p.SkipPing,
@@ -368,7 +377,7 @@ func createPools(ctx context.Context, cfg config.Config) (uploadPool, downloadPo
 		uploadProviders[i] = toNNTPProvider(p)
 	}
 
-	uploadPool, err = nntppool.NewClient(ctx, uploadProviders)
+	uploadPool, err = nntppool.NewClient(ctx, uploadProviders, nntppool.WithSpeedAwareDispatch(true))
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create upload pool: %w", err)
 	}
@@ -378,7 +387,7 @@ func createPools(ctx context.Context, cfg config.Config) (uploadPool, downloadPo
 		downloadProviders[i] = toNNTPProvider(p)
 	}
 
-	downloadPool, err = nntppool.NewClient(ctx, downloadProviders)
+	downloadPool, err = nntppool.NewClient(ctx, downloadProviders, nntppool.WithSpeedAwareDispatch(true))
 	if err != nil {
 		_ = uploadPool.Close()
 		return nil, nil, fmt.Errorf("failed to create download pool: %w", err)

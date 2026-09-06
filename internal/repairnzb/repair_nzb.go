@@ -12,24 +12,26 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/Tensai75/nzbparser"
 	nntppool "github.com/javi11/nntppool/v4"
 	"github.com/kipsilabs/nzb-repair/internal/config"
-	"github.com/k0kubun/go-ansi"
 	"github.com/mnightingale/rapidyenc"
-	"github.com/schollz/progressbar/v3"
 	"github.com/sourcegraph/conc/pool"
 )
 
-// NNTPPool is the interface for NNTP operations used by the repair process.
+// Downloader fetches articles and checks their availability.
 // *nntppool.Client satisfies this interface.
-type NNTPPool interface {
+type Downloader interface {
 	BodyStream(ctx context.Context, messageID string, w io.Writer, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error)
+	StatMany(ctx context.Context, messageIDs []string, opts nntppool.StatManyOptions) <-chan nntppool.StatManyResult
+}
+
+// Uploader posts articles.
+// *nntppool.Client satisfies this interface.
+type Uploader interface {
 	PostYenc(ctx context.Context, headers nntppool.PostHeaders, body io.Reader, meta rapidyenc.Meta) (*nntppool.PostResult, error)
-	Close() error
 }
 
 const defaultSegmentSize = 750_000 // bytes per uploaded segment for recreated par2 files
@@ -100,33 +102,57 @@ func retryDownload(ctx context.Context, cfg config.Config, label string, op func
 	}
 }
 
-// countMissingParSegments checks par2 segments without writing to disk.
-// Returns (missing, total, error).
+// countMissingParSegments reports how many par2 segments are unavailable.
+//
+// Availability is probed with STAT rather than by fetching bodies: STAT carries
+// no payload, so the whole set can be swept concurrently at round-trip cost
+// instead of transferring — and discarding — every par2 segment. The sweep runs
+// on the background lane so it cannot starve foreground downloads.
 func countMissingParSegments(
 	ctx context.Context,
 	cfg config.Config,
-	downloadPool NNTPPool,
+	downloadPool Downloader,
 	parFiles []nzbparser.NzbFile,
 ) (missing, total int64, err error) {
+	ids := make([]string, 0)
 	for _, f := range parFiles {
 		for _, s := range f.Segments {
-			total++
-			if ctx.Err() != nil {
-				return missing, total, ctx.Err()
-			}
-			segErr := retryDownload(ctx, cfg, s.Id, func() error {
-				_, e := downloadPool.BodyStream(ctx, s.Id, io.Discard)
-				return e
-			})
-			if segErr != nil {
-				if errors.Is(segErr, nntppool.ErrArticleNotFound) {
-					missing++
-				} else if !errors.Is(segErr, context.Canceled) {
-					return missing, total, fmt.Errorf("error checking par2 segment %s: %w", s.Id, segErr)
-				}
-			}
+			ids = append(ids, s.Id)
 		}
 	}
+
+	if len(ids) == 0 {
+		return 0, 0, nil
+	}
+
+	results := downloadPool.StatMany(ctx, ids, nntppool.StatManyOptions{
+		Concurrency: cfg.StatConcurrency,
+		Background:  true,
+	})
+
+	for r := range results {
+		total++
+
+		switch {
+		case r.Err == nil:
+		case errors.Is(r.Err, nntppool.ErrArticleNotFound):
+			missing++
+		case errors.Is(r.Err, context.Canceled):
+		default:
+			// Drain the channel so the sweep's goroutines are not left blocked.
+			go func() {
+				for range results { //nolint:revive // drain only
+				}
+			}()
+
+			return missing, total, fmt.Errorf("error checking par2 segment %s: %w", r.MessageID, r.Err)
+		}
+	}
+
+	if ctx.Err() != nil {
+		return missing, total, ctx.Err()
+	}
+
 	return missing, total, nil
 }
 
@@ -135,28 +161,60 @@ func uploadPar2Files(
 	ctx context.Context,
 	par2FilePaths []string,
 	cfg config.Config,
-	uploadPool NNTPPool,
+	uploadPool Uploader,
 	nzb *nzbparser.Nzb,
-) ([]nzbparser.NzbFile, error) {
-	var newFiles []nzbparser.NzbFile
-
+) (newFiles []nzbparser.NzbFile, err error) {
 	groups := []string{}
 	if len(nzb.Files) > 0 {
 		groups = nzb.Files[0].Groups
 	}
 
-	for _, path := range par2FilePaths {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read par2 file %s: %w", path, err)
+	// One pool spans every par2 file: uploading a file at a time would drain
+	// the connection pool at each file boundary.
+	p := pool.New().WithContext(ctx).
+		WithMaxGoroutines(workerCount(cfg.UploadWorkers)).
+		WithCancelOnError()
+
+	var openFiles []*os.File
+
+	defer func() {
+		for _, f := range openFiles {
+			_ = f.Close()
+		}
+	}()
+
+	newFiles = make([]nzbparser.NzbFile, len(par2FilePaths))
+
+	for fileIdx, path := range par2FilePaths {
+		// Segments are read straight off disk through per-segment section
+		// readers. Slurping each file into memory would hold every par2 file
+		// resident at once, which at the default redundancy is a sizeable
+		// fraction of the release.
+		fh, openErr := os.Open(path)
+		if openErr != nil {
+			// The shared pool already has segments in flight for earlier files;
+			// drain it before the deferred close reaches their handles.
+			_ = p.Wait()
+
+			return nil, fmt.Errorf("failed to open par2 file %s: %w", path, openErr)
+		}
+
+		openFiles = append(openFiles, fh)
+
+		info, statErr := fh.Stat()
+		if statErr != nil {
+			_ = p.Wait()
+
+			return nil, fmt.Errorf("failed to stat par2 file %s: %w", path, statErr)
 		}
 
 		filename := filepath.Base(path)
-		fileSize := int64(len(data))
-		segSize := defaultSegmentSize
-		totalSegments := (len(data) + segSize - 1) / segSize
+		fileSize := info.Size()
+		segSize := int64(defaultSegmentSize)
+		totalSegments := int((fileSize + segSize - 1) / segSize)
 
-		nzbFile := nzbparser.NzbFile{
+		segments := make([]nzbparser.NzbSegment, totalSegments)
+		newFiles[fileIdx] = nzbparser.NzbFile{
 			Filename:      filename,
 			Basefilename:  filename,
 			Poster:        "nzb-repair",
@@ -164,27 +222,19 @@ func uploadPar2Files(
 			TotalSegments: totalSegments,
 			Bytes:         fileSize,
 			Groups:        groups,
+			Segments:      segments,
 		}
 
-		p := pool.New().WithContext(ctx).
-			WithMaxGoroutines(cfg.UploadWorkers).
-			WithCancelOnError()
-
-		segments := make([]nzbparser.NzbSegment, totalSegments)
 		for i := range totalSegments {
 			segNum := i + 1
-			start := i * segSize
-			end := start + segSize
-			if end > len(data) {
-				end = len(data)
-			}
-			chunk := make([]byte, end-start)
-			copy(chunk, data[start:end])
+			offset := int64(i) * segSize
+			partSize := min(segSize, fileSize-offset)
 
 			p.Go(func(ctx context.Context) error {
 				msgId := generateRandomMessageID()
 				subject := fmt.Sprintf("[1/1] \"%s\" yEnc (%d/%d)", filename, segNum, totalSegments)
 				fName := filename
+
 				if cfg.Upload.ObfuscationPolicy != config.ObfuscationPolicyNone {
 					fName = rand.Text()
 					subject = rand.Text()
@@ -199,30 +249,34 @@ func uploadPar2Files(
 				meta := rapidyenc.Meta{
 					FileName:   fName,
 					FileSize:   fileSize,
-					PartSize:   int64(len(chunk)),
+					PartSize:   partSize,
 					PartNumber: int64(segNum),
-					Offset:     int64(start),
+					Offset:     offset,
 					TotalParts: int64(totalSegments),
 				}
-				if _, err := uploadPool.PostYenc(ctx, headers, bytes.NewReader(chunk), meta); err != nil {
+
+				// The pool consumes the body exactly once, so a single-pass
+				// section reader over the open file is enough.
+				body := io.NewSectionReader(fh, offset, partSize)
+				if _, err := uploadPool.PostYenc(ctx, headers, body, meta); err != nil {
 					return fmt.Errorf("failed to upload par2 segment: %w", err)
 				}
+
 				segments[i] = nzbparser.NzbSegment{
-					Bytes:  len(chunk),
+					Bytes:  int(partSize),
 					Number: segNum,
 					Id:     msgId,
 				}
+
 				return nil
 			})
 		}
 
-		if err := p.Wait(); err != nil {
-			return nil, err
-		}
+		slog.InfoContext(ctx, "Queued par2 file for upload", "filename", filename, "segments", totalSegments)
+	}
 
-		nzbFile.Segments = segments
-		newFiles = append(newFiles, nzbFile)
-		slog.InfoContext(ctx, "Uploaded par2 file", "filename", filename, "segments", totalSegments)
+	if err := p.Wait(); err != nil {
+		return nil, err
 	}
 
 	return newFiles, nil
@@ -231,8 +285,8 @@ func uploadPar2Files(
 func RepairNzb(
 	ctx context.Context,
 	cfg config.Config,
-	downloadPool NNTPPool,
-	uploadPool NNTPPool,
+	downloadPool Downloader,
+	uploadPool Uploader,
 	par2Executor Par2Executor,
 	nzbFile string,
 	outputFile string,
@@ -305,20 +359,11 @@ func RepairNzb(
 		}
 	}()
 
-	// Download files
+	// Download every segment of every file through one pool, so connections
+	// stay saturated across file boundaries.
 	startTime := time.Now()
-	for _, f := range restFiles {
-		if ctx.Err() != nil {
-			slog.With("err", err).ErrorContext(ctx, "repair canceled")
-
-			return nil
-		}
-
-		err := downloadWorker(ctx, cfg, downloadPool, f, brokenSegmentCh, tmpDir)
-		if err != nil {
-			slog.With("err", err).ErrorContext(ctx, "failed to download file")
-		}
-
+	if err := downloadAll(ctx, cfg, downloadPool, restFiles, brokenSegmentCh, tmpDir); err != nil {
+		slog.With("err", err).ErrorContext(ctx, "failed to download files")
 	}
 
 	close(brokenSegmentCh)
@@ -359,14 +404,8 @@ func RepairNzb(
 	// Repair broken data segments (if any)
 	if len(brokenSegments) > 0 {
 		slog.InfoContext(ctx, fmt.Sprintf("%d broken segments found. Downloading par2 files", len(brokenSegments)))
-		for _, f := range parFiles {
-			if ctx.Err() != nil {
-				return nil
-			}
-
-			if err := downloadWorker(ctx, cfg, downloadPool, f, nil, tmpDir); err != nil {
-				slog.With("err", err).InfoContext(ctx, "failed to download par2 file, cancelling repair")
-			}
+		if err := downloadAll(ctx, cfg, downloadPool, parFiles, nil, tmpDir); err != nil {
+			slog.With("err", err).InfoContext(ctx, "failed to download par2 files, cancelling repair")
 		}
 
 		if err := par2Executor.Repair(ctx, tmpDir); err != nil {
@@ -463,9 +502,23 @@ func replaceBrokenSegments(
 	brokenSegments map[*nzbparser.NzbFile][]brokenSegment,
 	tmpFolder string,
 	cfg config.Config,
-	uploadPool NNTPPool,
+	uploadPool Uploader,
 	nzb *nzbparser.Nzb,
 ) error {
+	// One pool spans every repaired file: a pool per file drains to zero at
+	// each file boundary and pays the ramp-up again for the next one.
+	p := pool.New().WithContext(ctx).
+		WithMaxGoroutines(workerCount(cfg.UploadWorkers)).
+		WithCancelOnError()
+
+	var openFiles []*os.File
+
+	defer func() {
+		for _, f := range openFiles {
+			_ = f.Close()
+		}
+	}()
+
 	for nzbFile, bs := range brokenSegments {
 		if ctx.Err() != nil {
 			slog.ErrorContext(ctx, "repair canceled")
@@ -473,19 +526,24 @@ func replaceBrokenSegments(
 			return nil
 		}
 
-		tmpFile, err := os.Open(filepath.Join(tmpFolder, nzbFile.Filename))
-		if err != nil {
-			slog.With("err", err).ErrorContext(ctx, "failed to open file")
+		tmpFile, openErr := os.Open(filepath.Join(tmpFolder, nzbFile.Filename))
+		if openErr != nil {
+			slog.With("err", openErr).ErrorContext(ctx, "failed to open file")
+			// Uploads for earlier files are already running against handles in
+			// openFiles; drain the pool before the deferred close reaches them.
+			_ = p.Wait()
 
-			return err
+			return openErr
 		}
 
-		fs, err := tmpFile.Stat()
-		if err != nil {
-			slog.With("err", err).ErrorContext(ctx, "failed to get file info")
-			_ = tmpFile.Close()
+		openFiles = append(openFiles, tmpFile)
 
-			return err
+		fs, statErr := tmpFile.Stat()
+		if statErr != nil {
+			slog.With("err", statErr).ErrorContext(ctx, "failed to get file info")
+			_ = p.Wait()
+
+			return statErr
 		}
 
 		fileSize := fs.Size()
@@ -494,15 +552,9 @@ func replaceBrokenSegments(
 		// The repaired file contains decoded binary data, so compute offsets from actual file size.
 		decodedSegSize := (fileSize + totalSegments - 1) / totalSegments
 
-		p := pool.New().WithContext(ctx).
-			WithMaxGoroutines(cfg.UploadWorkers).
-			WithCancelOnError()
-
 		for _, s := range bs {
 			p.Go(func(ctx context.Context) error {
 				if ctx.Err() != nil {
-					slog.With("err", err).ErrorContext(ctx, "repair canceled")
-
 					return nil
 				}
 
@@ -569,148 +621,25 @@ func replaceBrokenSegments(
 			})
 		}
 
-		if err := p.Wait(); err != nil {
-			slog.With("err", err).ErrorContext(ctx, "failed to upload segments")
-			_ = tmpFile.Close()
+	}
 
-			return err
-		}
+	if err := p.Wait(); err != nil {
+		slog.With("err", err).ErrorContext(ctx, "failed to upload segments")
 
-		_ = tmpFile.Close()
+		return err
+	}
+
+	// Splice the repaired files back into the NZB only once every segment has
+	// been posted, so a partial upload never rewrites the manifest.
+	for nzbFile, bs := range brokenSegments {
 		slog.InfoContext(ctx, fmt.Sprintf("Uploaded %d segments for file %s", len(bs), nzbFile.Filename))
 
-		// Replace the original broken file in the nzb with the repaired version
 		for i, f := range nzb.Files {
 			if f.Filename == nzbFile.Filename {
 				nzb.Files[i] = *nzbFile
 				break
 			}
 		}
-	}
-
-	return nil
-}
-
-func downloadWorker(
-	ctx context.Context,
-	config config.Config,
-	downloadPool NNTPPool,
-	file nzbparser.NzbFile,
-	brokenSegmentCh chan<- brokenSegment,
-	tmpFolder string,
-) error {
-	brokenSegmentCounter := atomic.Int64{}
-
-	p := pool.New().WithContext(ctx).
-		WithMaxGoroutines(config.DownloadWorkers).
-		WithCancelOnError()
-
-	slog.InfoContext(ctx, fmt.Sprintf("Starting downloading file %s", file.Filename))
-
-	filePath := filepath.Join(tmpFolder, file.Filename)
-
-	// Check if file exists
-	if _, err := os.Stat(filePath); err == nil {
-		slog.InfoContext(ctx, fmt.Sprintf("File %s already exists, skipping download", file.Filename))
-		return nil
-	}
-
-	fileWriter, err := os.Create(filePath)
-	if err != nil {
-		slog.With("err", err).ErrorContext(ctx, "failed to create file: %v")
-
-		return fmt.Errorf("failed to create file: %w", err)
-	}
-
-	defer func() {
-		_ = fileWriter.Close()
-	}()
-
-	bar := progressbar.NewOptions(int(file.Bytes),
-		progressbar.OptionSetWriter(ansi.NewAnsiStdout()),
-		progressbar.OptionEnableColorCodes(true),
-		progressbar.OptionSetWidth(15),
-		progressbar.OptionShowBytes(true),
-		progressbar.OptionShowTotalBytes(true),
-		progressbar.OptionSetTheme(progressbar.Theme{
-			Saucer:        "[green]=[reset]",
-			SaucerHead:    "[green]>[reset]",
-			SaucerPadding: " ",
-			BarStart:      "[",
-			BarEnd:        "]",
-		}))
-
-	c, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	once := sync.Once{}
-
-	for _, s := range file.Segments {
-		select {
-		case <-c.Done():
-			return nil
-		case <-ctx.Done():
-			return nil
-		default:
-			p.Go(func(c context.Context) error {
-				buff := bytes.NewBuffer(make([]byte, 0))
-				err := retryDownload(c, config, s.Id, func() error {
-					buff.Reset() // discard partial writes from a failed attempt
-					_, e := downloadPool.BodyStream(c, s.Id, buff)
-					return e
-				})
-				if err != nil {
-					if errors.Is(err, nntppool.ErrArticleNotFound) {
-						if brokenSegmentCh != nil {
-							slog.DebugContext(ctx, fmt.Sprintf("segment %s not found, sending for repair: %v", s.Id, err))
-
-							brokenSegmentCh <- brokenSegment{
-								segment: &s,
-								file:    &file,
-							}
-							brokenSegmentCounter.Add(1)
-
-							// Recalculate segment size for wrong segment sizes
-							once.Do(func() {
-								for _, s := range file.Segments {
-									s.Bytes = buff.Len()
-								}
-							})
-						} else if !errors.Is(err, context.Canceled) {
-							return fmt.Errorf("segment %v not found", s.Id)
-						}
-
-						return nil
-					}
-
-					if errors.Is(err, context.Canceled) {
-						return nil
-					}
-
-					slog.ErrorContext(ctx, fmt.Sprintf("failed to download segment %s canceling the repair: %v", s.Id, err))
-					cancel()
-
-					return err
-				}
-
-				start := (s.Number - 1) * buff.Len()
-
-				_, err = fileWriter.WriteAt(buff.Bytes(), int64(start))
-				if err != nil {
-					slog.With("err", err).ErrorContext(ctx, "failed to write segment")
-
-					return err
-				}
-
-				_ = bar.Add(s.Bytes)
-
-				return nil
-			})
-		}
-	}
-
-	if err := p.Wait(); err != nil {
-		return err
 	}
 
 	return nil

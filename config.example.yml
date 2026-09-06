@@ -14,6 +14,18 @@ download_providers:
     quota_period_hours: 0   # 0 = no rolling window
     reconnect_delay_seconds: 30  # re-add a provider this long after a 502; 0 = default (30s), negative = disabled
 
+    # --- Throughput tuning (all optional; sensible values are derived when unset) ---
+    inflight: 5           # concurrent article bodies per connection; 0 = default (5)
+    stat_inflight: 100    # pipeline depth for bodyless STAT probes; 0 = default (100)
+    min_connections: 5    # connections dialed eagerly at startup; 0 = half of connections
+    stream_inflight: 0    # cap on priority-lane bodies per connection; 0 = pool default
+    background_floor: 0   # background-lane requests kept in flight; 0 = pool default
+    abort_drain_bytes: 0  # drop rather than drain a cancelled body past this size; 0 = pool default (1 MiB)
+    attempt_timeout: 0s   # dispatch + first response byte per attempt; 0 = adaptive from measured RTT
+    stall_timeout: 0s     # rolling progress deadline for a body transfer; 0 = pool default (8s)
+    storage_group: ""     # label providers sharing a backbone so a 430 skips its peers
+    name: ""              # stable name in pool stats and errors
+
 upload_providers:
   - host: upload.example.com
     port: 119
@@ -29,6 +41,10 @@ upload_providers:
     quota_bytes: 0
     quota_period_hours: 0
 
+    # --- Throughput tuning (see download_providers above) ---
+    inflight: 5
+    min_connections: 3
+
 # Scan interval for the directory watcher in duration string like "40s" "5m", "1h"
 scan_interval: 5m
 
@@ -43,3 +59,13 @@ download_retry_max_delay: 60s  # 0 = default (60s)
 
 # Folder to move broken files to
 broken_folder: broken
+
+# Concurrent article existence checks (STAT) during the par2 availability sweep.
+# STAT transfers no article body, so this can run far wider than the download
+# worker count. 0 = default (64).
+stat_concurrency: 64
+
+# Worker budgets. When unset, each defaults to the sum of connections x inflight
+# across that pool's providers, which matches the pool's real concurrency.
+# download_workers: 50
+# upload_workers: 10
