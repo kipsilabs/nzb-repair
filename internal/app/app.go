@@ -13,11 +13,11 @@ import (
 	"time"
 
 	nntppool "github.com/javi11/nntppool/v4"
-	"github.com/javi11/nzb-repair/internal/config"
-	"github.com/javi11/nzb-repair/internal/queue"
-	"github.com/javi11/nzb-repair/internal/repairnzb"
-	"github.com/javi11/nzb-repair/internal/scanner"
-	"github.com/javi11/nzb-repair/pkg/par2exedownloader"
+	"github.com/kipsilabs/nzb-repair/internal/config"
+	"github.com/kipsilabs/nzb-repair/internal/queue"
+	"github.com/kipsilabs/nzb-repair/internal/repairnzb"
+	"github.com/kipsilabs/nzb-repair/internal/scanner"
+	"github.com/kipsilabs/nzb-repair/pkg/par2exedownloader"
 	"golang.org/x/sync/errgroup"
 )
 

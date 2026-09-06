@@ -7,8 +7,8 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/javi11/nzb-repair/internal/app"
-	"github.com/javi11/nzb-repair/internal/config"
+	"github.com/kipsilabs/nzb-repair/internal/app"
+	"github.com/kipsilabs/nzb-repair/internal/config"
 	"github.com/spf13/cobra"
 )
 

@@ -17,7 +17,7 @@ import (
 
 	"github.com/Tensai75/nzbparser"
 	nntppool "github.com/javi11/nntppool/v4"
-	"github.com/javi11/nzb-repair/internal/config"
+	"github.com/kipsilabs/nzb-repair/internal/config"
 	"github.com/k0kubun/go-ansi"
 	"github.com/mnightingale/rapidyenc"
 	"github.com/schollz/progressbar/v3"
