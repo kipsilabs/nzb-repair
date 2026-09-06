@@ -34,8 +34,8 @@ func TestRepairNzb(t *testing.T) {
 		},
 	}
 
-	mockDownloadPool := mocks.NewMockNNTPPool(ctrl)
-	mockUploadPool := mocks.NewMockNNTPPool(ctrl)
+	mockDownloadPool := mocks.NewMockDownloader(ctrl)
+	mockUploadPool := mocks.NewMockUploader(ctrl)
 	mockPar2Executor := mocks.NewMockPar2Executor(ctrl) // Instantiate the mock executor
 
 	// Create a temporary directory for testing
@@ -87,10 +87,10 @@ func TestRepairNzb(t *testing.T) {
 
 	// Download Expectations:
 	// Segment 1 (broken) - Not Found
-	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), brokenSegmentID, gomock.Any()).
+	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), brokenSegmentID, gomock.Any(), gomock.Any()).
 		Return(nil, nntppool.ErrArticleNotFound)
 	// Segment 2 (good) - Found & Written
-	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), goodSegmentID, gomock.Any()).
+	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), goodSegmentID, gomock.Any(), gomock.Any()).
 		DoAndReturn(func(_ context.Context, _ string, writer io.Writer, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
 			if writer != nil {
 				// Simulate writing segment 2 content to the correct offset in the temp file
@@ -114,7 +114,7 @@ func TestRepairNzb(t *testing.T) {
 			return &nntppool.ArticleBody{}, nil
 		}).Times(1)
 	// Par2 Segment - Found & Written
-	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), parSegmentID, gomock.Any()).
+	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), parSegmentID, gomock.Any(), gomock.Any()).
 		DoAndReturn(func(_ context.Context, _ string, writer io.Writer, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
 			// Simulate writing the par2 file content
 			parFilePath := filepath.Join(tmpDir, par2FileName)
@@ -200,11 +200,11 @@ func TestRepairNzb_Par2ThresholdTriggersRecreation(t *testing.T) {
 		UploadWorkers:          1,
 		Par2RecreateThreshold:  1.0, // 100% — 1/1 missing triggers recreation
 		Par2RecreateRedundancy: 10,
-		Upload: config.UploadConfig{ObfuscationPolicy: config.ObfuscationPolicyNone},
+		Upload:                 config.UploadConfig{ObfuscationPolicy: config.ObfuscationPolicyNone},
 	}
 
-	mockDownloadPool := mocks.NewMockNNTPPool(ctrl)
-	mockUploadPool := mocks.NewMockNNTPPool(ctrl)
+	mockDownloadPool := mocks.NewMockDownloader(ctrl)
+	mockUploadPool := mocks.NewMockUploader(ctrl)
 	mockPar2Executor := mocks.NewMockPar2Executor(ctrl)
 
 	inputDir := t.TempDir()
@@ -233,15 +233,18 @@ func TestRepairNzb_Par2ThresholdTriggersRecreation(t *testing.T) {
 	require.NoError(t, os.WriteFile(nzbFile, []byte(nzbContent), 0644))
 
 	// Data segment found (no broken data segments)
-	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), dataSegID, gomock.Any()).
+	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), dataSegID, gomock.Any(), gomock.Any()).
 		DoAndReturn(func(_ context.Context, _ string, w io.Writer, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
 			_, _ = w.Write([]byte("videodata"))
 			return &nntppool.ArticleBody{}, nil
 		}).Times(1)
 
 	// Par2 segment is missing → threshold triggered
-	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), par2SegID, gomock.Any()).
-		Return(nil, nntppool.ErrArticleNotFound).Times(1)
+	mockDownloadPool.EXPECT().StatMany(gomock.Any(), []string{par2SegID}, gomock.Any()).
+		Return(statResults(nntppool.StatManyResult{
+			MessageID: par2SegID,
+			Err:       nntppool.ErrArticleNotFound,
+		})).Times(1)
 
 	// Expect Create (threshold exceeded); Repair must NOT be called
 	mockPar2Executor.EXPECT().Create(gomock.Any(), gomock.Any(), 10).
@@ -261,7 +264,7 @@ func TestRepairNzb_Par2ThresholdNotReached(t *testing.T) {
 		Par2RecreateThreshold: 0.5, // 50% — 0/1 missing, threshold not reached
 	}
 
-	mockDownloadPool := mocks.NewMockNNTPPool(ctrl)
+	mockDownloadPool := mocks.NewMockDownloader(ctrl)
 	mockPar2Executor := mocks.NewMockPar2Executor(ctrl)
 
 	inputDir := t.TempDir()
@@ -286,15 +289,18 @@ func TestRepairNzb_Par2ThresholdNotReached(t *testing.T) {
 	require.NoError(t, os.WriteFile(nzbFile, []byte(nzbContent), 0644))
 
 	// Data segment found
-	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), dataSegID, gomock.Any()).
+	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), dataSegID, gomock.Any(), gomock.Any()).
 		DoAndReturn(func(_ context.Context, _ string, w io.Writer, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
 			_, _ = w.Write([]byte("data"))
 			return &nntppool.ArticleBody{}, nil
 		}).Times(1)
 
 	// Par2 segment found (0% missing, threshold not reached)
-	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), par2SegID, gomock.Any()).
-		Return(&nntppool.ArticleBody{}, nil).Times(1)
+	mockDownloadPool.EXPECT().StatMany(gomock.Any(), []string{par2SegID}, gomock.Any()).
+		Return(statResults(nntppool.StatManyResult{
+			MessageID: par2SegID,
+			Result:    &nntppool.StatResult{MessageID: par2SegID},
+		})).Times(1)
 
 	// No Create, no Repair
 	mockPar2Executor.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
@@ -314,7 +320,7 @@ func TestRepairNzb_Par2ThresholdDisabled(t *testing.T) {
 		Par2RecreateThreshold: 0, // disabled
 	}
 
-	mockDownloadPool := mocks.NewMockNNTPPool(ctrl)
+	mockDownloadPool := mocks.NewMockDownloader(ctrl)
 	mockPar2Executor := mocks.NewMockPar2Executor(ctrl)
 
 	inputDir := t.TempDir()
@@ -339,14 +345,15 @@ func TestRepairNzb_Par2ThresholdDisabled(t *testing.T) {
 	require.NoError(t, os.WriteFile(nzbFile, []byte(nzbContent), 0644))
 
 	// Data segment found — threshold disabled so par2 NOT checked
-	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), dataSegID, gomock.Any()).
+	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), dataSegID, gomock.Any(), gomock.Any()).
 		DoAndReturn(func(_ context.Context, _ string, w io.Writer, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
 			_, _ = w.Write([]byte("data"))
 			return &nntppool.ArticleBody{}, nil
 		}).Times(1)
 
-	// Par2 must NOT be fetched for threshold check
-	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), par2SegID, gomock.Any()).Times(0)
+	// Par2 must NOT be probed at all when the threshold check is disabled
+	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), par2SegID, gomock.Any(), gomock.Any()).Times(0)
+	mockDownloadPool.EXPECT().StatMany(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
 
 	// No Create, no Repair
 	mockPar2Executor.EXPECT().Create(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
@@ -367,8 +374,8 @@ func TestRepairNzb_NoPar2Files(t *testing.T) {
 		UploadWorkers:   1,
 	}
 
-	mockDownloadPool := mocks.NewMockNNTPPool(ctrl)
-	mockUploadPool := mocks.NewMockNNTPPool(ctrl)
+	mockDownloadPool := mocks.NewMockDownloader(ctrl)
+	mockUploadPool := mocks.NewMockUploader(ctrl)
 	mockPar2Executor := mocks.NewMockPar2Executor(ctrl)
 
 	inputDir := t.TempDir()
@@ -403,9 +410,9 @@ func TestRepairNzb_NoPar2Files(t *testing.T) {
 	// --- Mock Expectations ---
 	// No downloads, repairs, or uploads should be attempted as there are no par files.
 	// We expect the function to return early.
-	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), gomock.Any(), gomock.Any()).Times(0) // No downloads expected
-	mockPar2Executor.EXPECT().Repair(gomock.Any(), gomock.Any()).Times(0)                   // No repair expected
-	mockUploadPool.EXPECT().PostYenc(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0) // No uploads expected
+	mockDownloadPool.EXPECT().BodyStream(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0) // No downloads expected
+	mockPar2Executor.EXPECT().Repair(gomock.Any(), gomock.Any()).Times(0)                                 // No repair expected
+	mockUploadPool.EXPECT().PostYenc(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Times(0)     // No uploads expected
 
 	// --- Call the function ---
 	err = RepairNzb(ctx, cfg, mockDownloadPool, mockUploadPool, mockPar2Executor, nzbFile, outputFile, tmpDir)
@@ -415,4 +422,16 @@ func TestRepairNzb_NoPar2Files(t *testing.T) {
 	// 1. Check that the output NZB file was NOT created
 	_, err = os.Stat(outputFile)
 	assert.True(t, os.IsNotExist(err), "Output NZB file should NOT exist when no par2 files are present")
+}
+
+// statResults returns a closed channel carrying the given STAT outcomes, as the
+// pool's StatMany does once a sweep completes.
+func statResults(results ...nntppool.StatManyResult) <-chan nntppool.StatManyResult {
+	ch := make(chan nntppool.StatManyResult, len(results))
+	for _, r := range results {
+		ch <- r
+	}
+	close(ch)
+
+	return ch
 }

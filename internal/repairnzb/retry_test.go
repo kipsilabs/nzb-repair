@@ -117,14 +117,14 @@ func TestRetryDownload_CancelDuringBackoff(t *testing.T) {
 	assert.Less(t, time.Since(start), time.Second, "must return promptly on cancel, not wait the full backoff")
 }
 
-func TestDownloadWorker_RetriesTransientThenSucceeds(t *testing.T) {
+func TestDownloadAll_RetriesTransientThenSucceeds(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
 	cfg := fastRetryConfig()
 	cfg.DownloadWorkers = 1
 
-	mockPool := mocks.NewMockNNTPPool(ctrl)
+	mockPool := mocks.NewMockDownloader(ctrl)
 	tmpDir := t.TempDir()
 
 	segID := "seg1@test"
@@ -137,17 +137,20 @@ func TestDownloadWorker_RetriesTransientThenSucceeds(t *testing.T) {
 	}
 
 	gomock.InOrder(
-		mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any()).Return(nil, errTransient),
-		mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any()).Return(nil, errTransient),
-		mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any()).
-			DoAndReturn(func(_ context.Context, _ string, w io.Writer, _ ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
+		mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any(), gomock.Any()).Return(nil, errTransient),
+		mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any(), gomock.Any()).Return(nil, errTransient),
+		mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ string, w io.Writer, onMeta ...func(nntppool.YEncMeta)) (*nntppool.ArticleBody, error) {
+				for _, fn := range onMeta {
+					fn(nntppool.YEncMeta{Part: 1, PartSize: int64(len(content))})
+				}
 				_, _ = w.Write(content)
 				return &nntppool.ArticleBody{}, nil
 			}),
 	)
 
 	brokenCh := make(chan brokenSegment, 1)
-	err := downloadWorker(context.Background(), cfg, mockPool, file, brokenCh, tmpDir)
+	err := downloadAll(context.Background(), cfg, mockPool, []nzbparser.NzbFile{file}, brokenCh, tmpDir)
 	require.NoError(t, err)
 	assert.Len(t, brokenCh, 0, "successful download must not queue a broken segment")
 
@@ -156,7 +159,7 @@ func TestDownloadWorker_RetriesTransientThenSucceeds(t *testing.T) {
 	assert.Equal(t, content, written)
 }
 
-func TestDownloadWorker_RetryExhaustionReturnsError(t *testing.T) {
+func TestDownloadAll_RetryExhaustionReturnsError(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
@@ -164,7 +167,7 @@ func TestDownloadWorker_RetryExhaustionReturnsError(t *testing.T) {
 	cfg.DownloadWorkers = 1
 	cfg.DownloadRetries = 2
 
-	mockPool := mocks.NewMockNNTPPool(ctrl)
+	mockPool := mocks.NewMockDownloader(ctrl)
 	tmpDir := t.TempDir()
 
 	segID := "seg1@test"
@@ -176,22 +179,22 @@ func TestDownloadWorker_RetryExhaustionReturnsError(t *testing.T) {
 	}
 
 	// 1 initial + 2 retries = 3 attempts, all failing.
-	mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any()).
+	mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any(), gomock.Any()).
 		Return(nil, errTransient).Times(3)
 
-	err := downloadWorker(context.Background(), cfg, mockPool, file, nil, tmpDir)
+	err := downloadAll(context.Background(), cfg, mockPool, []nzbparser.NzbFile{file}, nil, tmpDir)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, errTransient)
 }
 
-func TestDownloadWorker_ArticleNotFoundNoRetry(t *testing.T) {
+func TestDownloadAll_ArticleNotFoundNoRetry(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
 	cfg := fastRetryConfig()
 	cfg.DownloadWorkers = 1
 
-	mockPool := mocks.NewMockNNTPPool(ctrl)
+	mockPool := mocks.NewMockDownloader(ctrl)
 	tmpDir := t.TempDir()
 
 	segID := "missing@test"
@@ -203,25 +206,25 @@ func TestDownloadWorker_ArticleNotFoundNoRetry(t *testing.T) {
 	}
 
 	// Must be called exactly once — no retries for a genuinely missing article.
-	mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any()).
+	mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any(), gomock.Any()).
 		Return(nil, nntppool.ErrArticleNotFound).Times(1)
 
 	brokenCh := make(chan brokenSegment, 1)
-	err := downloadWorker(context.Background(), cfg, mockPool, file, brokenCh, tmpDir)
+	err := downloadAll(context.Background(), cfg, mockPool, []nzbparser.NzbFile{file}, brokenCh, tmpDir)
 	require.NoError(t, err)
 	require.Len(t, brokenCh, 1, "missing segment must be routed for repair")
 	bs := <-brokenCh
 	assert.Equal(t, segID, bs.segment.Id)
 }
 
-func TestDownloadWorker_QuotaExceededNoRetry(t *testing.T) {
+func TestDownloadAll_QuotaExceededNoRetry(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
 
 	cfg := fastRetryConfig()
 	cfg.DownloadWorkers = 1
 
-	mockPool := mocks.NewMockNNTPPool(ctrl)
+	mockPool := mocks.NewMockDownloader(ctrl)
 	tmpDir := t.TempDir()
 
 	segID := "seg1@test"
@@ -233,10 +236,10 @@ func TestDownloadWorker_QuotaExceededNoRetry(t *testing.T) {
 	}
 
 	// Quota won't recover this run — no retries, terminal error.
-	mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any()).
+	mockPool.EXPECT().BodyStream(gomock.Any(), segID, gomock.Any(), gomock.Any()).
 		Return(nil, nntppool.ErrQuotaExceeded).Times(1)
 
-	err := downloadWorker(context.Background(), cfg, mockPool, file, nil, tmpDir)
+	err := downloadAll(context.Background(), cfg, mockPool, []nzbparser.NzbFile{file}, nil, tmpDir)
 	require.Error(t, err)
 }
 

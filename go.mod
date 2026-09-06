@@ -11,7 +11,7 @@ tool (
 
 require (
 	github.com/Tensai75/nzbparser v0.1.0
-	github.com/javi11/nntppool/v4 v4.11.1
+	github.com/javi11/nntppool/v4 v4.23.0
 	github.com/k0kubun/go-ansi v0.0.0-20180517002512-3bf9e2903213
 	github.com/mattn/go-sqlite3 v1.14.27
 	github.com/mnightingale/rapidyenc v0.0.0-20251128204712-7aafef1eaf1c

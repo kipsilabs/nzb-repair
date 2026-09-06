@@ -50,6 +50,38 @@ type ProviderConfig struct {
 	// provider that was removed after a 502 "service unavailable" response.
 	// 0 defaults to 30s; use a negative value to disable auto-reconnect.
 	ReconnectDelaySeconds int `yaml:"reconnect_delay_seconds"`
+	// Name is the stable identity reported in pool stats and errors. Empty
+	// falls back to the host+username derivation.
+	Name string `yaml:"name"`
+	// MinConnections is how many connections are dialed eagerly at startup
+	// instead of lazily on first use, giving the provider a warm floor that
+	// ignores IdleTimeout. Defaults to half of Connections.
+	MinConnections int `yaml:"min_connections"`
+	// StatInflight is the pipeline depth for bodyless STAT commands. STAT
+	// carries no payload, so it can pipeline far deeper than Inflight without
+	// inflating download memory.
+	StatInflight int `yaml:"stat_inflight"`
+	// StreamInflight caps priority-lane bodies in flight per connection so a
+	// demand read never queues behind a long backlog. 0 lets the pool decide.
+	StreamInflight int `yaml:"stream_inflight"`
+	// BackgroundFloor bounds background-lane requests in flight while
+	// foreground traffic is active. 0 lets the pool decide.
+	BackgroundFloor int `yaml:"background_floor"`
+	// AbortDrainBytes is the cutoff past which a cancelled body drops the
+	// connection instead of draining the remaining bytes. 0 lets the pool
+	// decide; negative disables.
+	AbortDrainBytes int64 `yaml:"abort_drain_bytes"`
+	// StorageGroup labels providers sharing an upstream backbone, so a 430
+	// from one skips its peers for the same article.
+	StorageGroup string `yaml:"storage_group"`
+	// AttemptTimeout bounds dispatch plus time-to-first-response-byte per
+	// attempt. It does not bound the body transfer. 0 selects an adaptive
+	// value derived from measured RTT.
+	AttemptTimeout time.Duration `yaml:"attempt_timeout"`
+	// StallTimeout is the rolling progress deadline for a body transfer: the
+	// read deadline is extended on each chunk of progress, so a slow but
+	// healthy download survives while a truly stalled one is torn down.
+	StallTimeout time.Duration `yaml:"stall_timeout"`
 }
 
 type Config struct {
@@ -77,6 +109,9 @@ type Config struct {
 	DownloadRetryBaseDelay time.Duration `yaml:"download_retry_base_delay"`
 	// DownloadRetryMaxDelay caps the backoff between download retries.
 	DownloadRetryMaxDelay time.Duration `yaml:"download_retry_max_delay"`
+	// StatConcurrency is how many article existence checks (STAT) run at once
+	// during the par2 availability sweep.
+	StatConcurrency int `yaml:"stat_concurrency"`
 }
 
 type UploadConfig struct {
@@ -106,7 +141,53 @@ var (
 	downloadRetriesDefault        = int64(5)
 	downloadRetryBaseDelayDefault = 2 * time.Second
 	downloadRetryMaxDelayDefault  = 60 * time.Second
+	statConcurrencyDefault        = 64
 )
+
+// inflightDefault is the per-connection pipeline depth for body-bearing
+// commands. The pool itself defaults to 1, which leaves a connection idle for a
+// full round-trip between articles.
+const inflightDefault = 5
+
+// statInflightDefault pipelines bodyless STAT commands far deeper than bodies:
+// they carry no payload, so depth costs round-trips rather than memory.
+const statInflightDefault = 100
+
+// applyProviderDefaults fills unset provider fields with derived defaults and
+// reports the connection count the provider contributes to the worker budget.
+func applyProviderDefaults(p ProviderConfig) ProviderConfig {
+	if p.Connections == 0 {
+		p.Connections = providerConfigDefault.Connections
+	}
+
+	if p.IdleTimeout == 0 {
+		p.IdleTimeout = providerConfigDefault.IdleTimeout
+	}
+
+	if p.ReconnectDelaySeconds == 0 {
+		p.ReconnectDelaySeconds = providerConfigDefault.ReconnectDelaySeconds
+	}
+
+	if p.Inflight == 0 {
+		p.Inflight = inflightDefault
+	}
+
+	if p.StatInflight == 0 {
+		p.StatInflight = statInflightDefault
+	}
+
+	// Pre-warm half the pool so the first articles do not each pay a dial and
+	// handshake. MinConnections must never exceed Connections.
+	if p.MinConnections == 0 {
+		p.MinConnections = p.Connections / 2
+	}
+
+	if p.MinConnections > p.Connections {
+		p.MinConnections = p.Connections
+	}
+
+	return p
+}
 
 func mergeWithDefault(config ...Config) Config {
 	if len(config) == 0 {
@@ -123,6 +204,7 @@ func mergeWithDefault(config ...Config) Config {
 			DownloadRetries:        downloadRetriesDefault,
 			DownloadRetryBaseDelay: downloadRetryBaseDelayDefault,
 			DownloadRetryMaxDelay:  downloadRetryMaxDelayDefault,
+			StatConcurrency:        statConcurrencyDefault,
 		}
 	}
 
@@ -130,20 +212,11 @@ func mergeWithDefault(config ...Config) Config {
 
 	downloadWorkers := 0
 	for i, p := range cfg.DownloadProviders {
-		if p.Connections == 0 {
-			p.Connections = providerConfigDefault.Connections
-		}
-
-		if p.IdleTimeout == 0 {
-			p.IdleTimeout = providerConfigDefault.IdleTimeout
-		}
-
-		if p.ReconnectDelaySeconds == 0 {
-			p.ReconnectDelaySeconds = providerConfigDefault.ReconnectDelaySeconds
-		}
-
+		p = applyProviderDefaults(p)
 		cfg.DownloadProviders[i] = p
-		downloadWorkers += p.Connections
+		// Each connection carries Inflight concurrent bodies, so the useful
+		// worker count is the product, not the connection count alone.
+		downloadWorkers += p.Connections * p.Inflight
 	}
 
 	if cfg.DownloadWorkers == 0 {
@@ -152,20 +225,9 @@ func mergeWithDefault(config ...Config) Config {
 
 	uploadWorkers := 0
 	for i, p := range cfg.UploadProviders {
-		if p.Connections == 0 {
-			p.Connections = providerConfigDefault.Connections
-		}
-
-		if p.IdleTimeout == 0 {
-			p.IdleTimeout = providerConfigDefault.IdleTimeout
-		}
-
-		if p.ReconnectDelaySeconds == 0 {
-			p.ReconnectDelaySeconds = providerConfigDefault.ReconnectDelaySeconds
-		}
-
+		p = applyProviderDefaults(p)
 		cfg.UploadProviders[i] = p
-		uploadWorkers += p.Connections
+		uploadWorkers += p.Connections * p.Inflight
 	}
 
 	if cfg.UploadWorkers == 0 {
@@ -198,6 +260,10 @@ func mergeWithDefault(config ...Config) Config {
 
 	if cfg.DownloadRetryMaxDelay == 0 {
 		cfg.DownloadRetryMaxDelay = downloadRetryMaxDelayDefault
+	}
+
+	if cfg.StatConcurrency == 0 {
+		cfg.StatConcurrency = statConcurrencyDefault
 	}
 
 	return cfg
