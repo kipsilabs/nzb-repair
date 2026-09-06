@@ -1,4 +1,4 @@
-module github.com/javi11/nzb-repair
+module github.com/kipsilabs/nzb-repair
 
 go 1.25.1
 

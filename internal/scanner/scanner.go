@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/javi11/nzb-repair/internal/queue"
+	"github.com/kipsilabs/nzb-repair/internal/queue"
 	"github.com/opencontainers/selinux/pkg/pwalkdir"
 )
 

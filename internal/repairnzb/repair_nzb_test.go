@@ -11,8 +11,8 @@ import (
 
 	"github.com/Tensai75/nzbparser"
 	nntppool "github.com/javi11/nntppool/v4"
-	"github.com/javi11/nzb-repair/internal/config"
-	"github.com/javi11/nzb-repair/internal/mocks" // Import the generated mocks
+	"github.com/kipsilabs/nzb-repair/internal/config"
+	"github.com/kipsilabs/nzb-repair/internal/mocks" // Import the generated mocks
 	"github.com/mnightingale/rapidyenc"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
